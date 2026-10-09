@@ -36,7 +36,7 @@ jobs:
 
       # Live per-job spans, exported during the run (outbound to in-cluster collector)
       - name: OpenTelemetry job instrumentation
-        uses: snoby/opentelemetry-github/actions/instrument/job@main
+        uses: snoby/opentelemetry-github/actions/instrument/job@lab-patches
         with:
           self_monitoring: false
           secrets_to_redact: '{"github_token": "${{ github.token }}"}'
