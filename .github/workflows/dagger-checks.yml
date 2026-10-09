@@ -20,7 +20,7 @@ on:
 
 jobs:
   config:
-    runs-on: ${{ values.runnerLabel }}
+    runs-on: k8s-runner
     outputs:
       build_checks: ${{ steps.cfg.outputs.build_checks }}
       test_checks: ${{ steps.cfg.outputs.test_checks }}
@@ -57,7 +57,7 @@ jobs:
       - name: Run build-plane checks (dagger)
         if: needs.config.outputs.build_checks != ''
         run: |
-          MODULE="${{ values.daggerModule }}"
+          MODULE="github.com/snoby-demo-org/dagger-checks"
           for check in ${{ needs.config.outputs.build_checks }}; do
             echo "::group::[$check]"
             dagger call --mod "$MODULE" "$check" --source=.
@@ -67,7 +67,7 @@ jobs:
       - name: Capture image digest handoff
         if: contains(needs.config.outputs.build_checks, 'build')
         run: |
-          MODULE="${{ values.daggerModule }}"
+          MODULE="github.com/snoby-demo-org/dagger-checks"
           dagger call --mod "$MODULE" build --source=. | tee digest.log
           grep -o 'sha256:[a-f0-9]*' digest.log | tail -1 > digest.txt
 
@@ -100,7 +100,7 @@ jobs:
       - name: Run test-plane checks (dagger)
         if: needs.config.outputs.test_checks != ''
         run: |
-          MODULE="${{ values.daggerModule }}"
+          MODULE="github.com/snoby-demo-org/dagger-checks"
           for check in ${{ needs.config.outputs.test_checks }}; do
             echo "::group::[$check]"
             dagger call --mod "$MODULE" "$check" --source=.
