@@ -24,6 +24,8 @@ permissions:
 env:
   OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector.otel.svc.cluster.local:4318
   OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  # LAB: export direct to in-cluster collector - skip the action's 80MB local otelcol download
+  OTEL_SHELL_SKIP_LOCAL_COLLECTOR: "TRUE"
 
 jobs:
   export:
