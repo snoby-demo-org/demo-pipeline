@@ -1,0 +1,9 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: demo-pipeline
+  description: Golden-path pipeline demo (stub checks)
+spec:
+  type: service
+  owner: snoby
+  system: goldenpath
