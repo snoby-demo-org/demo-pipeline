@@ -38,6 +38,7 @@ jobs:
       - name: OpenTelemetry job instrumentation
         uses: snoby/opentelemetry-github/actions/instrument/job@lab-patches
         with:
+          github_token: ${{ github.token }}
           self_monitoring: false
           secrets_to_redact: '{"github_token": "${{ github.token }}"}'
 
