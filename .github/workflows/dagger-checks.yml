@@ -110,7 +110,7 @@ jobs:
         env:
           # Tag this check's trace with the GH run id + the check name so Tempo
           # can filter per-check traces per run, per job.
-          OTEL_RESOURCE_ATTRIBUTES: "github.actions.workflow_run.id=${{ github.run_id }},github.actions.job.name=build/${{ matrix.check }}"
+          OTEL_RESOURCE_ATTRIBUTES: "github.actions.workflow_run.id=${{ github.run_id }},github.actions.job.name=build/${{ matrix.check }},github.actions.commit=${{ github.sha }}"
         run: |
           dagger call --mod "github.com/snoby-demo-org/dagger-checks" "${{ matrix.check }}" --source=.
 
@@ -134,7 +134,7 @@ jobs:
 
       - name: Build image and capture digest
         env:
-          OTEL_RESOURCE_ATTRIBUTES: "github.actions.workflow_run.id=${{ github.run_id }},github.actions.job.name=build/build"
+          OTEL_RESOURCE_ATTRIBUTES: "github.actions.workflow_run.id=${{ github.run_id }},github.actions.job.name=build/build,github.actions.commit=${{ github.sha }}"
         run: |
           dagger call --mod "github.com/snoby-demo-org/dagger-checks" build --source=. | tee digest.log
           grep -o 'sha256:[a-f0-9]*' digest.log | tail -1 > digest.txt
@@ -178,6 +178,6 @@ jobs:
 
       - name: Run check [${{ matrix.check }}]
         env:
-          OTEL_RESOURCE_ATTRIBUTES: "github.actions.workflow_run.id=${{ github.run_id }},github.actions.job.name=test/${{ matrix.check }}"
+          OTEL_RESOURCE_ATTRIBUTES: "github.actions.workflow_run.id=${{ github.run_id }},github.actions.job.name=test/${{ matrix.check }},github.actions.commit=${{ github.sha }}"
         run: |
           dagger call --mod "github.com/snoby-demo-org/dagger-checks" "${{ matrix.check }}" --source=.
