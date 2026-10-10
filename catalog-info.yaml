@@ -3,7 +3,10 @@ kind: Component
 metadata:
   name: demo-pipeline
   description: Golden-path pipeline demo (stub checks)
+  annotations:
+    github.com/project-slug: snoby-demo-org/demo-pipeline
 spec:
   type: service
+  lifecycle: experimental
   owner: snoby
   system: goldenpath
