@@ -26,6 +26,9 @@ name: Dagger Checks
 # artifact) plus one machine-queryable log line:
 #     TRUENORTH_CHECK_RESULT {"check":...,"status":...,"mode":...}
 # The build-report job aggregates these into TRUENORTH_BUILD_REPORT.
+# Enforcement core (blocks/flags/budget + the check-leg exit decision) lives
+# in .github/truenorth_report.py — pure functions, unit-tested by tests/ and
+# run on every push by the unit-tests job; build-report BLOCKS if they fail.
 
 permissions:
   # artifact handshake between live spans and the post-hoc export (actions:write upload / :read download)
@@ -170,6 +173,27 @@ jobs:
           print("module         :", cfg.get("pipeline", {}).get("module"))
           EOF
 
+  # Pipeline unit tests (no dagger, no registry): lock the enforcement model —
+  # required stops, blocking stops unless excepted, advisory continues — so a
+  # regression in the gates fails the run instead of silently minting a green.
+  # build-report BLOCKS on this job failing (TN_UNIT_RESULT).
+  unit-tests:
+    needs: config
+    runs-on: ${{ fromJSON(needs.config.outputs.planes).build }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: OpenTelemetry job instrumentation
+        uses: snoby/opentelemetry-github/actions/instrument/job@lab-patches
+        with:
+          github_token: ${{ github.token }}
+          self_monitoring: false
+          secrets_to_redact: '{"github_token": "${{ github.token }}"}'
+
+      - name: Enforcement unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
   # Every build-plane scan check = one parallel ARC runner pod (own process /
   # own engine session), all launched immediately, none waiting on `build`.
   # Source-scope scans have no `needs: build` — they start in parallel with it.
@@ -206,6 +230,9 @@ jobs:
 
           import yaml
 
+          sys.path.insert(0, os.path.join(os.environ.get("GITHUB_WORKSPACE", "."), ".github"))
+          import truenorth_report as tn
+
           check = os.environ["TN_CHECK"]
           module = os.environ["TN_MODULE"]
           c = (yaml.safe_load(open(".github/truenorth.yaml")).get("checks", {}) or {}).get(check, {})
@@ -236,30 +263,19 @@ jobs:
               except json.JSONDecodeError:
                   print("::warning::TRUENORTH_RESULT line was not valid JSON — ignored")
 
-          result = {
-              "check": check,
-              "status": "pass" if proc.returncode == 0 else "fail",
-              "mode": mode, "tier": tier,
-              "score": score, "findings": findings,
-              "duration_ms": dur, "exit_code": proc.returncode,
-              "commit": os.environ["GITHUB_SHA"],
-              "run_id": int(os.environ["GITHUB_RUN_ID"]),
-              "job": os.environ.get("TN_JOB_NAME", f"build/{check}"),
-              "details": details,
-          }
-          os.makedirs("results", exist_ok=True)
-          with open(f"results/{check}.json", "w") as f:
-              json.dump(result, f)
-          with open(f"results/{check}.stdout.log", "w") as f:
-              f.write(out)
+          result = tn.build_result(check, c, proc.returncode, dur,
+                                   run_id=int(os.environ["GITHUB_RUN_ID"]),
+                                   commit=os.environ["GITHUB_SHA"],
+                                   job=os.environ.get("TN_JOB_NAME", f"build/{check}"),
+                                   score=score, findings=findings, details=details)
+          tn.write_result(result, out)
 
           print("TRUENORTH_CHECK_RESULT " + json.dumps(result, separators=(",", ":")), flush=True)
 
           # Advisory findings never block (FR-59/60): record and exit green.
           if mode == "advisory" and proc.returncode != 0:
               print(f"::warning::advisory check '{check}' failed — recorded as flag in the build report, does not block")
-              sys.exit(0)
-          sys.exit(proc.returncode)
+          sys.exit(tn.harness_exit_code(mode, proc.returncode))
           HARNESS
 
       - name: Upload check result artifact
@@ -303,6 +319,9 @@ jobs:
 
           import yaml
 
+          sys.path.insert(0, os.path.join(os.environ.get("GITHUB_WORKSPACE", "."), ".github"))
+          import truenorth_report as tn
+
           check = os.environ["TN_CHECK"]
           module = os.environ["TN_MODULE"]
           c = (yaml.safe_load(open(".github/truenorth.yaml")).get("checks", {}) or {}).get(check, {})
@@ -343,29 +362,19 @@ jobs:
           if registry:
               details["registry"] = registry
 
-          result = {
-              "check": check,
-              "status": "pass" if proc.returncode == 0 else "fail",
-              "mode": c.get("mode", "blocking"), "tier": c.get("tier", "fast"),
-              "score": score, "findings": findings,
-              "duration_ms": dur, "exit_code": proc.returncode,
-              "commit": os.environ["GITHUB_SHA"],
-              "run_id": int(os.environ["GITHUB_RUN_ID"]),
-              "job": os.environ.get("TN_JOB_NAME", f"build/{check}"),
-              "details": details,
-          }
-          os.makedirs("results", exist_ok=True)
-          with open(f"results/{check}.json", "w") as f:
-              json.dump(result, f)
-          with open(f"results/{check}.stdout.log", "w") as f:
-              f.write(out)
+          result = tn.build_result(check, c, proc.returncode, dur,
+                                   run_id=int(os.environ["GITHUB_RUN_ID"]),
+                                   commit=os.environ["GITHUB_SHA"],
+                                   job=os.environ.get("TN_JOB_NAME", f"build/{check}"),
+                                   score=score, findings=findings, details=details)
+          tn.write_result(result, out)
           if digest:
               with open("digest.txt", "w") as f:
                   f.write(digest + "\n")
 
           print("produced digest:", digest)
           print("TRUENORTH_CHECK_RESULT " + json.dumps(result, separators=(",", ":")), flush=True)
-          sys.exit(proc.returncode)
+          sys.exit(tn.harness_exit_code(c.get("mode", "blocking"), proc.returncode))
           HARNESS
 
       - name: Upload digest artifact (build -> test handoff)
@@ -424,6 +433,9 @@ jobs:
 
           import yaml
 
+          sys.path.insert(0, os.path.join(os.environ.get("GITHUB_WORKSPACE", "."), ".github"))
+          import truenorth_report as tn
+
           check = os.environ["TN_CHECK"]
           module = os.environ["TN_MODULE"]
           c = (yaml.safe_load(open(".github/truenorth.yaml")).get("checks", {}) or {}).get(check, {})
@@ -452,29 +464,18 @@ jobs:
               except json.JSONDecodeError:
                   print("::warning::TRUENORTH_RESULT line was not valid JSON — ignored")
 
-          result = {
-              "check": check,
-              "status": "pass" if proc.returncode == 0 else "fail",
-              "mode": mode, "tier": tier,
-              "score": score, "findings": findings,
-              "duration_ms": dur, "exit_code": proc.returncode,
-              "commit": os.environ["GITHUB_SHA"],
-              "run_id": int(os.environ["GITHUB_RUN_ID"]),
-              "job": os.environ.get("TN_JOB_NAME", f"test/{check}"),
-              "details": details,
-          }
-          os.makedirs("results", exist_ok=True)
-          with open(f"results/{check}.json", "w") as f:
-              json.dump(result, f)
-          with open(f"results/{check}.stdout.log", "w") as f:
-              f.write(out)
+          result = tn.build_result(check, c, proc.returncode, dur,
+                                   run_id=int(os.environ["GITHUB_RUN_ID"]),
+                                   commit=os.environ["GITHUB_SHA"],
+                                   job=os.environ.get("TN_JOB_NAME", f"test/{check}"),
+                                   score=score, findings=findings, details=details)
+          tn.write_result(result, out)
 
           print("TRUENORTH_CHECK_RESULT " + json.dumps(result, separators=(",", ":")), flush=True)
 
           if mode == "advisory" and proc.returncode != 0:
               print(f"::warning::advisory check '{check}' failed — recorded as flag in the build report, does not block")
-              sys.exit(0)
-          sys.exit(proc.returncode)
+          sys.exit(tn.harness_exit_code(mode, proc.returncode))
           HARNESS
 
       - name: Upload check result artifact
@@ -487,11 +488,13 @@ jobs:
   # Build report (FR-58..FR-61): aggregate every check's structured result into
   # the run-level truth — blocks (required disabled/failed, blocking failure
   # without exception) vs flags (advisory findings, out-of-policy exceptions) —
-  # and the error budget. Blocks fail this job (hard stop, run goes red);
-  # flags never do. Also renders the CIT handoff payload (FR-25/26) so the
-  # webhook step (separate) carries it on publish.
+  # and the error budget. The enforcement core lives in
+  # .github/truenorth_report.py (unit-tested by tests/, run by unit-tests job).
+  # Blocks fail this job (hard stop, run goes red); flags never do. Also
+  # renders the CIT handoff payload (FR-25/26) so the webhook step (separate)
+  # carries it on publish.
   build-report:
-    needs: [config, build-checks, build, test-checks]
+    needs: [config, unit-tests, build-checks, build, test-checks]
     if: ${{ always() }}
     runs-on: ${{ fromJSON(needs.config.outputs.planes).build }}
     steps:
@@ -517,164 +520,8 @@ jobs:
         if: always()
         env:
           TN_REGISTRY: ${{ needs.config.outputs.registry }}
-        run: |
-          python3 - <<'REPORT'
-          import datetime, glob, json, os, sys
-
-          import yaml
-
-          run_id = int(os.environ["GITHUB_RUN_ID"])
-          commit = os.environ["GITHUB_SHA"]
-          repo = os.environ["GITHUB_REPOSITORY"]
-
-          cfg = yaml.safe_load(open(".github/truenorth.yaml"))
-          checks_cfg = cfg.get("checks", {})
-
-          exceptions = []
-          try:
-              exceptions = (yaml.safe_load(open(".github/truenorth-exceptions.yaml")) or {}).get("exceptions", [])
-          except FileNotFoundError:
-              pass
-          today = datetime.date.today().isoformat()
-
-          def exc_for(check):
-              for e in exceptions:
-                  if e.get("check") == check and str(e.get("until", "0000-00-00")) >= today:
-                      return e
-              return None
-
-          results = {}
-          for p in glob.glob("results/*.json"):
-              try:
-                  r = json.load(open(p))
-                  results[r["check"]] = r
-              except (json.JSONDecodeError, KeyError):
-                  print(f"::warning::unparseable check result: {p}")
-
-          blocks, flags, clean = [], [], []
-          budget = {"advisory_findings": 0, "out_of_policy_exceptions": 0,
-                    "disabled_required": 0, "total": 0}
-
-          # A run with no results at all (e.g. config failed, nothing ran) blocks.
-          if not results:
-              blocks.append({"check": "pipeline", "type": "no_results",
-                             "reason": "no check produced a result — config invalid or nothing ran"})
-
-          for name, c in checks_cfg.items():
-              mode = c.get("mode", "blocking")
-              if not c.get("enabled", True):
-                  if mode == "required":
-                      blocks.append({"check": name, "type": "disabled_required",
-                                     "reason": "required check disabled — hard stop (FR-59)"})
-                      budget["disabled_required"] += 1
-                  continue
-              r = results.get(name)
-              if r is None:
-                  if mode == "required":
-                      blocks.append({"check": name, "type": "missing_required",
-                                     "reason": "required check did not produce a result (FR-59)"})
-                  continue
-              if r.get("status") == "pass":
-                  clean.append({"check": name, "duration_ms": r.get("duration_ms")})
-                  continue
-              if mode == "required":
-                  blocks.append({"check": name, "type": "required_failure",
-                                 "reason": "required check failed — no exception path (FR-71)"})
-                  if exc_for(name):
-                      flags.append({"check": name, "type": "ignored_exception",
-                                    "reason": "exception present but required checks are never overridable (FR-71)"})
-              elif mode == "blocking":
-                  e = exc_for(name)
-                  if e:
-                      flags.append({"check": name, "type": "out_of_policy_exception",
-                                    "reason": f"blocking failure released under exception by {e.get('approver', '?')}: {e.get('reason', '')} (until {e.get('until')})"})
-                      budget["out_of_policy_exceptions"] += 1
-                  else:
-                      blocks.append({"check": name, "type": "blocking_failure",
-                                     "reason": "blocking check failed (FR-59)"})
-              else:
-                  flags.append({"check": name, "type": "advisory_finding",
-                                "reason": "advisory check failed — feeds error budget, does not block (FR-59)"})
-                  budget["advisory_findings"] += 1
-
-          budget["total"] = (budget["advisory_findings"] + budget["out_of_policy_exceptions"]
-                             + budget["disabled_required"])
-          conclusion = "blocked" if blocks else ("flagged" if flags else "clean")
-
-          report = {
-              "run_id": run_id, "commit": commit, "repo": repo,
-              "conclusion": conclusion,
-              "blocks": blocks, "flags": flags, "clean": clean,
-              "error_budget": budget,
-              "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-          }
-
-          # CIT handoff payload (FR-25/26): artifact metadata + checks truth +
-          # budget flag, structured for the webhook step and a future deploy stage.
-          build_r = results.get("build") or {}
-          handoff = {
-              "release": {"repo": repo, "commit": commit, "version": f"sha-{commit[:8]}"},
-              "artifact": {
-                  "registry": os.environ.get("TN_REGISTRY", cfg.get("pipeline", {}).get("registry", "")),
-                  "digest": (build_r.get("details") or {}).get("digest"),
-              },
-              "checks": {"passed": [c["check"] for c in clean],
-                         "blocked": [b["check"] for b in blocks],
-                         "flagged": [f["check"] for f in flags]},
-              "error_budget": budget,
-              "conclusion": conclusion,
-          }
-
-          os.makedirs("report", exist_ok=True)
-          json.dump(report, open("report/build-report.json", "w"), indent=2)
-          json.dump(handoff, open("report/cit-handoff.json", "w"), indent=2)
-
-          print(json.dumps(report, indent=2))
-          # Flat budget_total on the log line so LogQL can unwrap it as a metric
-          rline = dict(report)
-          rline["budget_total"] = budget["total"]
-          # tn_conclusion: the stream already carries a job-level `conclusion`
-          # LABEL from the log shipper, which would shadow the parsed JSON
-          # field in LogQL group-bys — so the run conclusion gets its own name.
-          rline["tn_conclusion"] = conclusion
-          print("TRUENORTH_BUILD_REPORT " + json.dumps(rline, separators=(",", ":")), flush=True)
-
-          # Run summary table (visible on the run page)
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "w") as f:
-              f.write("## TrueNorth build report\n\n")
-              f.write(f"**Conclusion:** `{conclusion}` — error budget consumed: **{budget['total']}**\n\n")
-              f.write("| Check | Mode | Status | Duration | Verdict |\n|---|---|---|---|---|\n")
-              for name, c in checks_cfg.items():
-                  if not c.get("enabled", True):
-                      f.write(f"| {name} | {c.get('mode')} | disabled | — | — |\n")
-                      continue
-                  r = results.get(name)
-                  if r is None:
-                      f.write(f"| {name} | {c.get('mode')} | no-result | — | — |\n")
-                      continue
-                  dur = f"{r.get('duration_ms', 0)/1000:.1f}s"
-                  verdict = "clean"
-                  if any(b["check"] == name for b in blocks):
-                      verdict = "BLOCK"
-                  elif any(fl["check"] == name for fl in flags):
-                      verdict = "FLAG"
-                  f.write(f"| {name} | {c.get('mode')} | {r.get('status')} | {dur} | {verdict} |\n")
-              if blocks:
-                  f.write("\n**BLOCKS (hard stop):**\n")
-                  for b in blocks:
-                      f.write(f"- `{b['check']}` — {b['reason']}\n")
-              if flags:
-                  f.write("\n**FLAGS (error budget):**\n")
-                  for fl in flags:
-                      f.write(f"- `{fl['check']}` — {fl['reason']}\n")
-
-          # Hard stop: blocks fail the job (FR-59: blocking failures block;
-          # FR-71: secrets/PII are never overridable).
-          for b in blocks:
-              print(f"::error::BLOCK {b['check']}: {b['reason']}")
-          if blocks:
-              sys.exit(1)
-          REPORT
+          TN_UNIT_RESULT: ${{ needs.unit-tests.result }}
+        run: python3 .github/truenorth_report.py
 
       - name: Upload build report
         if: always()
