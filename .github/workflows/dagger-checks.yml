@@ -633,6 +633,10 @@ jobs:
           # Flat budget_total on the log line so LogQL can unwrap it as a metric
           rline = dict(report)
           rline["budget_total"] = budget["total"]
+          # tn_conclusion: the stream already carries a job-level `conclusion`
+          # LABEL from the log shipper, which would shadow the parsed JSON
+          # field in LogQL group-bys — so the run conclusion gets its own name.
+          rline["tn_conclusion"] = conclusion
           print("TRUENORTH_BUILD_REPORT " + json.dumps(rline, separators=(",", ":")), flush=True)
 
           # Run summary table (visible on the run page)
