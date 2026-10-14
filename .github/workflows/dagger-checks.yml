@@ -132,6 +132,22 @@ jobs:
                   continue
               selected[name] = c
 
+          # Export the parsed check model (truenorth.yaml) as one structured
+          # log line per check — the dashboard's check-catalog source of truth
+          # (FR-45: pipeline results + catalog metadata ARE the dashboard data).
+          for name, c in checks.items():
+              line = {
+                  "check": name,
+                  "enabled": bool(c.get("enabled", True)),
+                  "mode": c.get("mode", "blocking"),
+                  "tier": c.get("tier", "fast"),
+                  "plane": c.get("plane", "build"),
+                  "deep_scan": deep,
+                  "run_id": int(os.environ["GITHUB_RUN_ID"]),
+                  "commit": os.environ["GITHUB_SHA"],
+              }
+              print("TRUENORTH_CONFIG " + json.dumps(line, separators=(",", ":")))
+
           # Every enabled build-plane check EXCEPT `build` becomes a parallel
           # scan pod. `build` is the digest producer (push + capture digest) —
           # it owns the handoff contract, so it is its own job, not in the matrix.
@@ -614,7 +630,10 @@ jobs:
           json.dump(handoff, open("report/cit-handoff.json", "w"), indent=2)
 
           print(json.dumps(report, indent=2))
-          print("TRUENORTH_BUILD_REPORT " + json.dumps(report, separators=(",", ":")), flush=True)
+          # Flat budget_total on the log line so LogQL can unwrap it as a metric
+          rline = dict(report)
+          rline["budget_total"] = budget["total"]
+          print("TRUENORTH_BUILD_REPORT " + json.dumps(rline, separators=(",", ":")), flush=True)
 
           # Run summary table (visible on the run page)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "w") as f:
