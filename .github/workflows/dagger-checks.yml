@@ -1,25 +1,31 @@
 name: Dagger Checks
 
-# Config-driven golden-path pipeline. Reads .github/goldenpath.yaml and fans
-# every enabled check out onto its OWN parallel runner pod, on the plane that
-# the config assigns it to:
+# TrueNorth golden-path pipeline. Config-driven: reads .github/truenorth.yaml
+# (the ONLY file a repo owns) and fans every enabled check out onto its OWN
+# parallel runner pod, on the plane the config assigns it to:
 #
 #   build-checks (matrix): every enabled build-plane check EXCEPT `build` =
 #     one parallel ARC runner pod, own process / own engine session. Source
-#     scans (lint, sast, pii-scan, format, private-key-check) launch
-#     immediately in parallel — no dependency on the image build.
-#   build (digest producer): pushes the real image to the zot registry and
-#     captures its digest — the handoff contract to the test plane.
+#     scans launch immediately in parallel — no dependency on the image build.
+#   build (digest producer): pushes the image to the registry and captures its
+#     digest — the handoff contract to the test plane.
 #   test-checks (matrix): every enabled test-plane check = one parallel ARC
-#     runner pod, gated on the build producing a digest. No engine-cache dep.
+#     runner pod, gated on the build producing a digest.
+#   build-report: consumes every check's structured result and produces the
+#     run-level build report (blocks / flags / error budget) — FR-58..FR-61.
 #
-# The matrix is built 100% from .github/goldenpath.yaml (the ONLY file a repo
-# owns): every check listed there becomes one matrix element = one runner pod,
-# running in parallel. Add/remove/enable/disable a check by editing
-# goldenpath.yaml — never this file.
+# Check model (FR-58/59): mode = required | blocking | advisory.
+#   required checks always run and hard-stop on failure or disablement;
+#   blocking failures block (unless a declared exception exists);
+#   advisory findings only feed the error budget and never block.
+# Tier model (FR-16): heavy-tier checks run only on an explicit deep-scan
+#   trigger (dispatch input, commit trailer, or PR label).
 #
-# Job-level context can't see step outputs, so the config is resolved in the
-# `config` job and consumed via needs.config.outputs (JSON for the matrix).
+# Check contract (FR-7/FR-11/FR-31): every check leg wraps the dagger call in
+# the result harness, which emits results/<check>.json (uploaded as an
+# artifact) plus one machine-queryable log line:
+#     TRUENORTH_CHECK_RESULT {"check":...,"status":...,"mode":...}
+# The build-report job aggregates these into TRUENORTH_BUILD_REPORT.
 
 permissions:
   # artifact handshake between live spans and the post-hoc export (actions:write upload / :read download)
@@ -44,6 +50,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      deep_scan:
+        description: "Deep scan: also run heavy-tier checks (FR-16)"
+        type: boolean
+        default: false
 
 jobs:
   config:
@@ -53,6 +64,9 @@ jobs:
       test_checks: ${{ steps.cfg.outputs.test_checks }}
       planes: ${{ steps.cfg.outputs.planes }}
       build_enabled: ${{ steps.cfg.outputs.build_enabled }}
+      module: ${{ steps.cfg.outputs.module }}
+      registry: ${{ steps.cfg.outputs.registry }}
+      deep_scan: ${{ steps.cfg.outputs.deep_scan }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -65,29 +79,79 @@ jobs:
           self_monitoring: false
           secrets_to_redact: '{"github_token": "${{ github.token }}"}'
 
-      - name: Load goldenpath config
+      - name: Load truenorth config
         id: cfg
+        env:
+          DEEP_SCAN_INPUT: ${{ inputs.deep_scan }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |
           python3 - <<'EOF'
-          import yaml, os, json
-          cfg = yaml.safe_load(open(".github/goldenpath.yaml"))
+          import json, os, re, sys
+          import yaml
+
+          try:
+              cfg = yaml.safe_load(open(".github/truenorth.yaml"))
+          except FileNotFoundError:
+              print("::error::.github/truenorth.yaml not found — it is the only file a repo owns to drive CI (FR-58).")
+              sys.exit(1)
+
           checks = cfg.get("checks", {})
           planes = cfg.get("planes", {})
-          enabled = {k: v for k, v in checks.items() if v.get("enabled")}
+
+          # --- validate the check model (FR-58/59) ----------------------------
+          MODES = {"required", "blocking", "advisory"}
+          errors = []
+          for name, c in checks.items():
+              mode = c.get("mode", "blocking")
+              if mode not in MODES:
+                  errors.append(f"{name}: mode must be one of {sorted(MODES)}, got '{mode}'")
+              if mode == "required" and c.get("enabled", True) is False:
+                  errors.append(f"{name}: required checks can never be disabled — hard stop (FR-59)")
+          if errors:
+              for e in errors:
+                  print(f"::error::truenorth.yaml invalid: {e}")
+              sys.exit(1)
+
+          # --- deep-scan trigger detection (FR-16) ----------------------------
+          deep = (
+              os.environ.get("DEEP_SCAN_INPUT", "").lower() == "true"
+              or "deep-scan" in os.environ.get("PR_LABELS", "")
+              or bool(re.search(r"Deep-Scan:\s*true", os.environ.get("COMMIT_MSG", "")))
+          )
+
+          # --- selection: enabled AND (fast tier OR deep scan OR required) ----
+          # Required checks always run regardless of tier — they are never off.
+          selected = {}
+          for name, c in checks.items():
+              if not c.get("enabled", True):
+                  continue
+              mode = c.get("mode", "blocking")
+              tier = c.get("tier", "fast")
+              if mode != "required" and tier == "heavy" and not deep:
+                  continue
+              selected[name] = c
+
           # Every enabled build-plane check EXCEPT `build` becomes a parallel
           # scan pod. `build` is the digest producer (push + capture digest) —
           # it owns the handoff contract, so it is its own job, not in the matrix.
-          scan_checks = [k for k, v in enabled.items() if v.get("plane") == "build" and k != "build"]
-          test_checks = [k for k, v in enabled.items() if v.get("plane") == "test"]
-          build_enabled = bool(enabled.get("build", {}).get("enabled"))
+          scan_checks = [k for k, c in selected.items() if c.get("plane", "build") == "build" and k != "build"]
+          test_checks = [k for k, c in selected.items() if c.get("plane") == "test"]
+          build_enabled = "build" in selected
+
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"scan_checks={json.dumps(scan_checks)}\n")
               f.write(f"test_checks={json.dumps(test_checks)}\n")
               f.write(f"planes={json.dumps(planes)}\n")
               f.write(f"build_enabled={str(build_enabled).lower()}\n")
+              f.write(f"module={cfg.get('pipeline', {}).get('module', '')}\n")
+              f.write(f"registry={cfg.get('pipeline', {}).get('registry', '')}\n")
+              f.write(f"deep_scan={str(deep).lower()}\n")
           print("build scan pods:", scan_checks)
-          print("build producer :", build_enabled)
           print("test pods      :", test_checks)
+          print("build producer :", build_enabled)
+          print("deep scan      :", deep)
+          print("module         :", cfg.get("pipeline", {}).get("module"))
           EOF
 
   # Every build-plane scan check = one parallel ARC runner pod (own process /
@@ -117,12 +181,81 @@ jobs:
           # Tag this check's trace with the GH run id + the check name so Tempo
           # can filter per-check traces per run, per job.
           OTEL_RESOURCE_ATTRIBUTES: "github.actions.workflow_run.id=${{ github.run_id }},github.actions.job.name=build/${{ matrix.check }},github.actions.commit=${{ github.sha }}"
+          TN_CHECK: ${{ matrix.check }}
+          TN_JOB_NAME: build/${{ matrix.check }}
+          TN_MODULE: ${{ needs.config.outputs.module }}
         run: |
-          dagger call --mod "github.com/snoby-demo-org/dagger-checks" "${{ matrix.check }}" --source=.
+          python3 - <<'HARNESS'
+          import json, os, re, subprocess, sys, time
 
-  # Digest producer: builds the real image, pushes to the zot registry, captures
-  # the real digest as the handoff artifact the test plane consumes. Launches in
-  # parallel with the build-checks scan fan-out (no `needs: build-checks`).
+          import yaml
+
+          check = os.environ["TN_CHECK"]
+          module = os.environ["TN_MODULE"]
+          c = (yaml.safe_load(open(".github/truenorth.yaml")).get("checks", {}) or {}).get(check, {})
+          mode = c.get("mode", "blocking")
+          tier = c.get("tier", "fast")
+
+          cmd = ["dagger", "call", "--mod", module, check, "--source=."]
+          t0 = time.monotonic()
+          proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, errors="replace")
+          dur = int((time.monotonic() - t0) * 1000)
+          out = proc.stdout
+          sys.stdout.write(out)   # keep the check's own output in the job log
+          sys.stdout.flush()
+
+          # Optional structured payload from the check itself (check contract,
+          # FR-7/FR-11): a line "TRUENORTH_RESULT: {json}" anywhere in output.
+          plain = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", out)
+          score, findings, details = None, None, {}
+          m = re.search(r"TRUENORTH_RESULT:\s*(\{.*\})", plain)
+          if m:
+              try:
+                  payload = json.loads(m.group(1))
+                  score = payload.get("score")
+                  findings = payload.get("findings")
+                  if isinstance(payload.get("details"), dict):
+                      details.update(payload["details"])
+              except json.JSONDecodeError:
+                  print("::warning::TRUENORTH_RESULT line was not valid JSON — ignored")
+
+          result = {
+              "check": check,
+              "status": "pass" if proc.returncode == 0 else "fail",
+              "mode": mode, "tier": tier,
+              "score": score, "findings": findings,
+              "duration_ms": dur, "exit_code": proc.returncode,
+              "commit": os.environ["GITHUB_SHA"],
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "job": os.environ.get("TN_JOB_NAME", f"build/{check}"),
+              "details": details,
+          }
+          os.makedirs("results", exist_ok=True)
+          with open(f"results/{check}.json", "w") as f:
+              json.dump(result, f)
+          with open(f"results/{check}.stdout.log", "w") as f:
+              f.write(out)
+
+          print("TRUENORTH_CHECK_RESULT " + json.dumps(result, separators=(",", ":")), flush=True)
+
+          # Advisory findings never block (FR-59/60): record and exit green.
+          if mode == "advisory" and proc.returncode != 0:
+              print(f"::warning::advisory check '{check}' failed — recorded as flag in the build report, does not block")
+              sys.exit(0)
+          sys.exit(proc.returncode)
+          HARNESS
+
+      - name: Upload check result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-result-${{ matrix.check }}
+          path: results/
+
+  # Digest producer: builds the real image, pushes to the registry, captures
+  # the real digest as the handoff artifact the test plane consumes. Launches
+  # in parallel with the build-checks scan fan-out (no `needs: build-checks`).
   build:
     needs: config
     if: needs.config.outputs.build_enabled == 'true'
@@ -141,20 +274,97 @@ jobs:
       - name: Build image and capture digest
         env:
           OTEL_RESOURCE_ATTRIBUTES: "github.actions.workflow_run.id=${{ github.run_id }},github.actions.job.name=build/build,github.actions.commit=${{ github.sha }}"
+          TN_CHECK: build
+          TN_JOB_NAME: build/build
+          TN_MODULE: ${{ needs.config.outputs.module }}
+          TN_REGISTRY: ${{ needs.config.outputs.registry }}
         run: |
           # No shell pipes here: the otel-shell job instrumentation wraps every
           # pipeline stage in fifo tee/wc plumbing that intermittently never
           # closes, leaving the reader (tail/tee) waiting for EOF forever.
-          dagger call --mod "github.com/snoby-demo-org/dagger-checks" build --source=. > digest.log
-          cat digest.log
-          awk 'match($0,/sha256:[a-f0-9]+/){d=substr($0,RSTART,RLENGTH)} END{print d}' digest.log > digest.txt
-          echo "produced digest: $(cat digest.txt)"
+          python3 - <<'HARNESS'
+          import json, os, re, subprocess, sys, time
+
+          import yaml
+
+          check = os.environ["TN_CHECK"]
+          module = os.environ["TN_MODULE"]
+          c = (yaml.safe_load(open(".github/truenorth.yaml")).get("checks", {}) or {}).get(check, {})
+
+          cmd = ["dagger", "call", "--mod", module, check, "--source=."]
+          t0 = time.monotonic()
+          proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, errors="replace")
+          dur = int((time.monotonic() - t0) * 1000)
+          out = proc.stdout
+          sys.stdout.write(out)
+          sys.stdout.flush()
+
+          plain = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", out)
+          score, findings, details = None, None, {}
+          m = re.search(r"TRUENORTH_RESULT:\s*(\{.*\})", plain)
+          if m:
+              try:
+                  payload = json.loads(m.group(1))
+                  score = payload.get("score")
+                  findings = payload.get("findings")
+                  if isinstance(payload.get("details"), dict):
+                      details.update(payload["details"])
+              except json.JSONDecodeError:
+                  pass
+
+          # Digest: prefer the contract payload, fall back to parsing stdout.
+          digest = details.get("digest")
+          if not digest:
+              last = None
+              for last in re.finditer(r"sha256:[a-f0-9]+", plain):
+                  pass
+              if last:
+                  digest = last.group(0)
+          if digest:
+              details["digest"] = digest
+          registry = os.environ.get("TN_REGISTRY", "")
+          if registry:
+              details["registry"] = registry
+
+          result = {
+              "check": check,
+              "status": "pass" if proc.returncode == 0 else "fail",
+              "mode": c.get("mode", "blocking"), "tier": c.get("tier", "fast"),
+              "score": score, "findings": findings,
+              "duration_ms": dur, "exit_code": proc.returncode,
+              "commit": os.environ["GITHUB_SHA"],
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "job": os.environ.get("TN_JOB_NAME", f"build/{check}"),
+              "details": details,
+          }
+          os.makedirs("results", exist_ok=True)
+          with open(f"results/{check}.json", "w") as f:
+              json.dump(result, f)
+          with open(f"results/{check}.stdout.log", "w") as f:
+              f.write(out)
+          if digest:
+              with open("digest.txt", "w") as f:
+                  f.write(digest + "\n")
+
+          print("produced digest:", digest)
+          print("TRUENORTH_CHECK_RESULT " + json.dumps(result, separators=(",", ":")), flush=True)
+          sys.exit(proc.returncode)
+          HARNESS
 
       - name: Upload digest artifact (build -> test handoff)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: image-digest
           path: digest.txt
+
+      - name: Upload check result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-result-build
+          path: results/
 
   # Every test-plane check = one parallel ARC runner pod, gated on the build
   # plane having produced a digest. Unconditional on the individual scan results
@@ -184,10 +394,275 @@ jobs:
           name: image-digest
 
       - name: Resolve image from registry
-        run: echo "test plane pulls $(cat digest.txt 2>/dev/null || echo 'no digest') from zot.viporlab.net"
+        run: echo "test plane pulls $(cat digest.txt 2>/dev/null || echo 'no digest') from ${{ needs.config.outputs.registry }}"
 
       - name: Run check [${{ matrix.check }}]
         env:
           OTEL_RESOURCE_ATTRIBUTES: "github.actions.workflow_run.id=${{ github.run_id }},github.actions.job.name=test/${{ matrix.check }},github.actions.commit=${{ github.sha }}"
+          TN_CHECK: ${{ matrix.check }}
+          TN_JOB_NAME: test/${{ matrix.check }}
+          TN_MODULE: ${{ needs.config.outputs.module }}
         run: |
-          dagger call --mod "github.com/snoby-demo-org/dagger-checks" "${{ matrix.check }}" --source=.
+          python3 - <<'HARNESS'
+          import json, os, re, subprocess, sys, time
+
+          import yaml
+
+          check = os.environ["TN_CHECK"]
+          module = os.environ["TN_MODULE"]
+          c = (yaml.safe_load(open(".github/truenorth.yaml")).get("checks", {}) or {}).get(check, {})
+          mode = c.get("mode", "blocking")
+          tier = c.get("tier", "fast")
+
+          cmd = ["dagger", "call", "--mod", module, check, "--source=."]
+          t0 = time.monotonic()
+          proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, errors="replace")
+          dur = int((time.monotonic() - t0) * 1000)
+          out = proc.stdout
+          sys.stdout.write(out)
+          sys.stdout.flush()
+
+          plain = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", out)
+          score, findings, details = None, None, {}
+          m = re.search(r"TRUENORTH_RESULT:\s*(\{.*\})", plain)
+          if m:
+              try:
+                  payload = json.loads(m.group(1))
+                  score = payload.get("score")
+                  findings = payload.get("findings")
+                  if isinstance(payload.get("details"), dict):
+                      details.update(payload["details"])
+              except json.JSONDecodeError:
+                  print("::warning::TRUENORTH_RESULT line was not valid JSON — ignored")
+
+          result = {
+              "check": check,
+              "status": "pass" if proc.returncode == 0 else "fail",
+              "mode": mode, "tier": tier,
+              "score": score, "findings": findings,
+              "duration_ms": dur, "exit_code": proc.returncode,
+              "commit": os.environ["GITHUB_SHA"],
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "job": os.environ.get("TN_JOB_NAME", f"test/{check}"),
+              "details": details,
+          }
+          os.makedirs("results", exist_ok=True)
+          with open(f"results/{check}.json", "w") as f:
+              json.dump(result, f)
+          with open(f"results/{check}.stdout.log", "w") as f:
+              f.write(out)
+
+          print("TRUENORTH_CHECK_RESULT " + json.dumps(result, separators=(",", ":")), flush=True)
+
+          if mode == "advisory" and proc.returncode != 0:
+              print(f"::warning::advisory check '{check}' failed — recorded as flag in the build report, does not block")
+              sys.exit(0)
+          sys.exit(proc.returncode)
+          HARNESS
+
+      - name: Upload check result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-result-${{ matrix.check }}
+          path: results/
+
+  # Build report (FR-58..FR-61): aggregate every check's structured result into
+  # the run-level truth — blocks (required disabled/failed, blocking failure
+  # without exception) vs flags (advisory findings, out-of-policy exceptions) —
+  # and the error budget. Blocks fail this job (hard stop, run goes red);
+  # flags never do. Also renders the CIT handoff payload (FR-25/26) so the
+  # webhook step (separate) carries it on publish.
+  build-report:
+    needs: [config, build-checks, build, test-checks]
+    if: ${{ always() }}
+    runs-on: ${{ fromJSON(needs.config.outputs.planes).build }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: OpenTelemetry job instrumentation
+        uses: snoby/opentelemetry-github/actions/instrument/job@lab-patches
+        with:
+          github_token: ${{ github.token }}
+          self_monitoring: false
+          secrets_to_redact: '{"github_token": "${{ github.token }}"}'
+
+      - name: Download all check results
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: check-result-*
+          merge-multiple: true
+          path: results/
+
+      - name: Aggregate build report
+        if: always()
+        env:
+          TN_REGISTRY: ${{ needs.config.outputs.registry }}
+        run: |
+          python3 - <<'REPORT'
+          import datetime, glob, json, os, sys
+
+          import yaml
+
+          run_id = int(os.environ["GITHUB_RUN_ID"])
+          commit = os.environ["GITHUB_SHA"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+
+          cfg = yaml.safe_load(open(".github/truenorth.yaml"))
+          checks_cfg = cfg.get("checks", {})
+
+          exceptions = []
+          try:
+              exceptions = (yaml.safe_load(open(".github/truenorth-exceptions.yaml")) or {}).get("exceptions", [])
+          except FileNotFoundError:
+              pass
+          today = datetime.date.today().isoformat()
+
+          def exc_for(check):
+              for e in exceptions:
+                  if e.get("check") == check and str(e.get("until", "0000-00-00")) >= today:
+                      return e
+              return None
+
+          results = {}
+          for p in glob.glob("results/*.json"):
+              try:
+                  r = json.load(open(p))
+                  results[r["check"]] = r
+              except (json.JSONDecodeError, KeyError):
+                  print(f"::warning::unparseable check result: {p}")
+
+          blocks, flags, clean = [], [], []
+          budget = {"advisory_findings": 0, "out_of_policy_exceptions": 0,
+                    "disabled_required": 0, "total": 0}
+
+          # A run with no results at all (e.g. config failed, nothing ran) blocks.
+          if not results:
+              blocks.append({"check": "pipeline", "type": "no_results",
+                             "reason": "no check produced a result — config invalid or nothing ran"})
+
+          for name, c in checks_cfg.items():
+              mode = c.get("mode", "blocking")
+              if not c.get("enabled", True):
+                  if mode == "required":
+                      blocks.append({"check": name, "type": "disabled_required",
+                                     "reason": "required check disabled — hard stop (FR-59)"})
+                      budget["disabled_required"] += 1
+                  continue
+              r = results.get(name)
+              if r is None:
+                  if mode == "required":
+                      blocks.append({"check": name, "type": "missing_required",
+                                     "reason": "required check did not produce a result (FR-59)"})
+                  continue
+              if r.get("status") == "pass":
+                  clean.append({"check": name, "duration_ms": r.get("duration_ms")})
+                  continue
+              if mode == "required":
+                  blocks.append({"check": name, "type": "required_failure",
+                                 "reason": "required check failed — no exception path (FR-71)"})
+                  if exc_for(name):
+                      flags.append({"check": name, "type": "ignored_exception",
+                                    "reason": "exception present but required checks are never overridable (FR-71)"})
+              elif mode == "blocking":
+                  e = exc_for(name)
+                  if e:
+                      flags.append({"check": name, "type": "out_of_policy_exception",
+                                    "reason": f"blocking failure released under exception by {e.get('approver', '?')}: {e.get('reason', '')} (until {e.get('until')})"})
+                      budget["out_of_policy_exceptions"] += 1
+                  else:
+                      blocks.append({"check": name, "type": "blocking_failure",
+                                     "reason": "blocking check failed (FR-59)"})
+              else:
+                  flags.append({"check": name, "type": "advisory_finding",
+                                "reason": "advisory check failed — feeds error budget, does not block (FR-59)"})
+                  budget["advisory_findings"] += 1
+
+          budget["total"] = (budget["advisory_findings"] + budget["out_of_policy_exceptions"]
+                             + budget["disabled_required"])
+          conclusion = "blocked" if blocks else ("flagged" if flags else "clean")
+
+          report = {
+              "run_id": run_id, "commit": commit, "repo": repo,
+              "conclusion": conclusion,
+              "blocks": blocks, "flags": flags, "clean": clean,
+              "error_budget": budget,
+              "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+          }
+
+          # CIT handoff payload (FR-25/26): artifact metadata + checks truth +
+          # budget flag, structured for the webhook step and a future deploy stage.
+          build_r = results.get("build") or {}
+          handoff = {
+              "release": {"repo": repo, "commit": commit, "version": f"sha-{commit[:8]}"},
+              "artifact": {
+                  "registry": os.environ.get("TN_REGISTRY", cfg.get("pipeline", {}).get("registry", "")),
+                  "digest": (build_r.get("details") or {}).get("digest"),
+              },
+              "checks": {"passed": [c["check"] for c in clean],
+                         "blocked": [b["check"] for b in blocks],
+                         "flagged": [f["check"] for f in flags]},
+              "error_budget": budget,
+              "conclusion": conclusion,
+          }
+
+          os.makedirs("report", exist_ok=True)
+          json.dump(report, open("report/build-report.json", "w"), indent=2)
+          json.dump(handoff, open("report/cit-handoff.json", "w"), indent=2)
+
+          print(json.dumps(report, indent=2))
+          print("TRUENORTH_BUILD_REPORT " + json.dumps(report, separators=(",", ":")), flush=True)
+
+          # Run summary table (visible on the run page)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "w") as f:
+              f.write("## TrueNorth build report\n\n")
+              f.write(f"**Conclusion:** `{conclusion}` — error budget consumed: **{budget['total']}**\n\n")
+              f.write("| Check | Mode | Status | Duration | Verdict |\n|---|---|---|---|---|\n")
+              for name, c in checks_cfg.items():
+                  if not c.get("enabled", True):
+                      f.write(f"| {name} | {c.get('mode')} | disabled | — | — |\n")
+                      continue
+                  r = results.get(name)
+                  if r is None:
+                      f.write(f"| {name} | {c.get('mode')} | no-result | — | — |\n")
+                      continue
+                  dur = f"{r.get('duration_ms', 0)/1000:.1f}s"
+                  verdict = "clean"
+                  if any(b["check"] == name for b in blocks):
+                      verdict = "BLOCK"
+                  elif any(fl["check"] == name for fl in flags):
+                      verdict = "FLAG"
+                  f.write(f"| {name} | {c.get('mode')} | {r.get('status')} | {dur} | {verdict} |\n")
+              if blocks:
+                  f.write("\n**BLOCKS (hard stop):**\n")
+                  for b in blocks:
+                      f.write(f"- `{b['check']}` — {b['reason']}\n")
+              if flags:
+                  f.write("\n**FLAGS (error budget):**\n")
+                  for fl in flags:
+                      f.write(f"- `{fl['check']}` — {fl['reason']}\n")
+
+          # Hard stop: blocks fail the job (FR-59: blocking failures block;
+          # FR-71: secrets/PII are never overridable).
+          for b in blocks:
+              print(f"::error::BLOCK {b['check']}: {b['reason']}")
+          if blocks:
+              sys.exit(1)
+          REPORT
+
+      - name: Upload build report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-report
+          path: report/build-report.json
+
+      - name: Upload CIT handoff payload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cit-handoff
+          path: report/cit-handoff.json
