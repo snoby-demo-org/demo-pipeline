@@ -238,6 +238,8 @@ jobs:
           c = (yaml.safe_load(open(".github/truenorth.yaml")).get("checks", {}) or {}).get(check, {})
           mode = c.get("mode", "blocking")
           tier = c.get("tier", "fast")
+          # per-check module override (FR-19 per-language modules)
+          module = c.get("module") or module
 
           cmd = ["dagger", "call", "--mod", module, check, "--source=."]
           t0 = time.monotonic()
@@ -325,6 +327,8 @@ jobs:
           check = os.environ["TN_CHECK"]
           module = os.environ["TN_MODULE"]
           c = (yaml.safe_load(open(".github/truenorth.yaml")).get("checks", {}) or {}).get(check, {})
+          # per-check module override (FR-19 per-language modules)
+          module = c.get("module") or module
 
           cmd = ["dagger", "call", "--mod", module, check, "--source=."]
           t0 = time.monotonic()
@@ -383,6 +387,7 @@ jobs:
         with:
           name: image-digest
           path: digest.txt
+          if-no-files-found: warn   # compile-only builds (no image) produce no digest
 
       - name: Upload check result artifact
         if: always()
@@ -441,6 +446,8 @@ jobs:
           c = (yaml.safe_load(open(".github/truenorth.yaml")).get("checks", {}) or {}).get(check, {})
           mode = c.get("mode", "blocking")
           tier = c.get("tier", "fast")
+          # per-check module override (FR-19 per-language modules)
+          module = c.get("module") or module
 
           cmd = ["dagger", "call", "--mod", module, check, "--source=."]
           t0 = time.monotonic()
