@@ -37,6 +37,7 @@ webhook:
 checks:
   lint:              { enabled: true, mode: blocking, tier: fast, plane: build, applies: [any] }
   sast:              { enabled: true, mode: blocking, tier: fast, plane: build, applies: [any] }
+  secrets-scan:      { enabled: true, mode: required, tier: fast, plane: build, applies: [any] }
   pii-scan:          { enabled: true, mode: required, tier: fast, plane: build, applies: [any] }
   private-key-check: { enabled: true, mode: required, tier: fast, plane: build, applies: [any] }
   format:            { enabled: true, mode: advisory, tier: fast, plane: build, applies: [any] }
