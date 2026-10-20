@@ -19,7 +19,7 @@
 #   applies: [stack] — applicability declaration (FR-58); "any" applies everywhere.
 
 pipeline:
-  module: github.com/snoby-demo-org/dagger-checks   # swap to the TrueNorth-owned module when it lands
+  module: github.com/snoby-demo-org/dagger-checks@v1.0.5   # pinned (FR-14); incremental pii-scan
   registry: zot.viporlab.net/demo
 
 planes:
